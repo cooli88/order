@@ -10,144 +10,207 @@ import (
 	orderv1 "github.com/demo/contracts/gen/go/order/v1"
 	"github.com/demo/order/internal/entity"
 	"github.com/demo/order/internal/store"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 func TestCheckOrderOwnerHandler(t *testing.T) {
-	tests := []struct {
-		name         string
-		request      *orderv1.CheckOrderOwnerRequest
-		setupMock    func() *store.MockOrderStore
-		wantErr      bool
-		wantCode     connect.Code
-		validateResp func(t *testing.T, resp *connect.Response[orderv1.CheckOrderOwnerResponse])
-	}{
+	// testData contains all data needed for a single test case
+	type testData struct {
+		ctx       context.Context
+		t         *testing.T
+		handler   *checkOrderOwnerHandler
+		mockStore *store.MockOrderStore
+		request   *connect.Request[orderv1.CheckOrderOwnerRequest]
+		response  *connect.Response[orderv1.CheckOrderOwnerResponse]
+		err       error
+	}
+
+	// testCase defines the GWT structure for each test
+	type testCase struct {
+		name  string
+		given func(*testData)
+		when  func(*testData)
+		then  func(*testData)
+	}
+
+	// setupTestData creates isolated test data for each test case
+	setupTestData := func(t *testing.T) *testData {
+		mockStore := &store.MockOrderStore{}
+
+		// Default mock behavior: return a valid order
+		mockStore.GetFunc = func(_ context.Context, id string) (*entity.Order, error) {
+			return &entity.Order{
+				ID:        id,
+				UserID:    "user-123",
+				Item:      "Test Item",
+				Amount:    100.00,
+				Status:    entity.OrderStatusNew,
+				CreatedAt: time.Now(),
+			}, nil
+		}
+
+		handler := newCheckOrderOwnerHandler(mockStore)
+
+		return &testData{
+			ctx:       context.Background(),
+			t:         t,
+			handler:   handler,
+			mockStore: mockStore,
+		}
+	}
+
+	testCases := []testCase{
+		// Success scenario: owner matches
 		{
-			name: "success",
-			request: &orderv1.CheckOrderOwnerRequest{
-				OrderId: "order-123",
-				UserId:  "user-456",
-			},
-			setupMock: func() *store.MockOrderStore {
-				return &store.MockOrderStore{
-					GetFunc: func(ctx context.Context, id string) (*entity.Order, error) {
-						require.Equal(t, "order-123", id)
-						return &entity.Order{
-							ID:        "order-123",
-							UserID:    "user-456",
-							Item:      "Test Item",
-							Amount:    49.99,
-							Status:    entity.OrderStatusNew,
-							CreatedAt: time.Now().UTC(),
-						}, nil
-					},
+			name: "Should return success when user is the owner of the order",
+			given: func(td *testData) {
+				td.mockStore.GetFunc = func(_ context.Context, id string) (*entity.Order, error) {
+					return &entity.Order{
+						ID:        id,
+						UserID:    "user-123",
+						Item:      "Test Item",
+						Amount:    100.00,
+						Status:    entity.OrderStatusNew,
+						CreatedAt: time.Now(),
+					}, nil
 				}
+				td.request = connect.NewRequest(&orderv1.CheckOrderOwnerRequest{
+					OrderId: "order-456",
+					UserId:  "user-123",
+				})
 			},
-			wantErr: false,
-			validateResp: func(t *testing.T, resp *connect.Response[orderv1.CheckOrderOwnerResponse]) {
-				require.NotNil(t, resp)
+			when: func(td *testData) {
+				td.response, td.err = td.handler.Handle(td.ctx, td.request)
+			},
+			then: func(td *testData) {
+				require.NoError(td.t, td.err)
+				require.NotNil(td.t, td.response)
+				// Verify empty response (success means user is the owner)
+				assert.Equal(td.t, &orderv1.CheckOrderOwnerResponse{}, td.response.Msg)
 			},
 		},
+
+		// Validation error: empty order_id
 		{
-			name: "empty_order_id",
-			request: &orderv1.CheckOrderOwnerRequest{
-				OrderId: "",
-				UserId:  "user-456",
+			name: "Should return InvalidArgument when order_id is empty",
+			given: func(td *testData) {
+				td.request = connect.NewRequest(&orderv1.CheckOrderOwnerRequest{
+					OrderId: "",
+					UserId:  "user-123",
+				})
 			},
-			setupMock: func() *store.MockOrderStore {
-				return &store.MockOrderStore{}
+			when: func(td *testData) {
+				td.response, td.err = td.handler.Handle(td.ctx, td.request)
 			},
-			wantErr:  true,
-			wantCode: connect.CodeInvalidArgument,
+			then: func(td *testData) {
+				require.Error(td.t, td.err)
+				assert.Equal(td.t, connect.CodeInvalidArgument, connect.CodeOf(td.err))
+				assert.Nil(td.t, td.response)
+			},
 		},
+
+		// Validation error: empty user_id
 		{
-			name: "empty_user_id",
-			request: &orderv1.CheckOrderOwnerRequest{
-				OrderId: "order-123",
-				UserId:  "",
+			name: "Should return InvalidArgument when user_id is empty",
+			given: func(td *testData) {
+				td.request = connect.NewRequest(&orderv1.CheckOrderOwnerRequest{
+					OrderId: "order-456",
+					UserId:  "",
+				})
 			},
-			setupMock: func() *store.MockOrderStore {
-				return &store.MockOrderStore{}
+			when: func(td *testData) {
+				td.response, td.err = td.handler.Handle(td.ctx, td.request)
 			},
-			wantErr:  true,
-			wantCode: connect.CodeInvalidArgument,
+			then: func(td *testData) {
+				require.Error(td.t, td.err)
+				assert.Equal(td.t, connect.CodeInvalidArgument, connect.CodeOf(td.err))
+				assert.Nil(td.t, td.response)
+			},
 		},
+
+		// NotFound: store returns ErrOrderNotFound
 		{
-			name: "not_found",
-			request: &orderv1.CheckOrderOwnerRequest{
-				OrderId: "non-existent-order",
-				UserId:  "user-456",
-			},
-			setupMock: func() *store.MockOrderStore {
-				return &store.MockOrderStore{
-					GetFunc: func(ctx context.Context, id string) (*entity.Order, error) {
-						return nil, store.ErrOrderNotFound
-					},
+			name: "Should return NotFound when order does not exist",
+			given: func(td *testData) {
+				td.mockStore.GetFunc = func(_ context.Context, _ string) (*entity.Order, error) {
+					return nil, store.ErrOrderNotFound
 				}
+				td.request = connect.NewRequest(&orderv1.CheckOrderOwnerRequest{
+					OrderId: "non-existent-order",
+					UserId:  "user-123",
+				})
 			},
-			wantErr:  true,
-			wantCode: connect.CodeNotFound,
+			when: func(td *testData) {
+				td.response, td.err = td.handler.Handle(td.ctx, td.request)
+			},
+			then: func(td *testData) {
+				require.Error(td.t, td.err)
+				assert.Equal(td.t, connect.CodeNotFound, connect.CodeOf(td.err))
+				assert.Nil(td.t, td.response)
+			},
 		},
+
+		// PermissionDenied: user_id doesn't match order's user_id
 		{
-			name: "wrong_owner",
-			request: &orderv1.CheckOrderOwnerRequest{
-				OrderId: "order-123",
-				UserId:  "different-user",
-			},
-			setupMock: func() *store.MockOrderStore {
-				return &store.MockOrderStore{
-					GetFunc: func(ctx context.Context, id string) (*entity.Order, error) {
-						return &entity.Order{
-							ID:        "order-123",
-							UserID:    "original-user",
-							Item:      "Test Item",
-							Amount:    49.99,
-							Status:    entity.OrderStatusNew,
-							CreatedAt: time.Now().UTC(),
-						}, nil
-					},
+			name: "Should return PermissionDenied when user is not the owner",
+			given: func(td *testData) {
+				td.mockStore.GetFunc = func(_ context.Context, id string) (*entity.Order, error) {
+					return &entity.Order{
+						ID:        id,
+						UserID:    "owner-user-789",
+						Item:      "Test Item",
+						Amount:    100.00,
+						Status:    entity.OrderStatusNew,
+						CreatedAt: time.Now(),
+					}, nil
 				}
+				td.request = connect.NewRequest(&orderv1.CheckOrderOwnerRequest{
+					OrderId: "order-456",
+					UserId:  "different-user-123",
+				})
 			},
-			wantErr:  true,
-			wantCode: connect.CodePermissionDenied,
+			when: func(td *testData) {
+				td.response, td.err = td.handler.Handle(td.ctx, td.request)
+			},
+			then: func(td *testData) {
+				require.Error(td.t, td.err)
+				assert.Equal(td.t, connect.CodePermissionDenied, connect.CodeOf(td.err))
+				assert.Contains(td.t, td.err.Error(), "order does not belong to user")
+				assert.Nil(td.t, td.response)
+			},
 		},
+
+		// Internal: store.Get() returns other error
 		{
-			name: "store_error",
-			request: &orderv1.CheckOrderOwnerRequest{
-				OrderId: "order-123",
-				UserId:  "user-456",
-			},
-			setupMock: func() *store.MockOrderStore {
-				return &store.MockOrderStore{
-					GetFunc: func(ctx context.Context, id string) (*entity.Order, error) {
-						return nil, errors.New("database connection failed")
-					},
+			name: "Should return Internal error when store returns unexpected error",
+			given: func(td *testData) {
+				td.mockStore.GetFunc = func(_ context.Context, _ string) (*entity.Order, error) {
+					return nil, errors.New("database connection failed")
 				}
+				td.request = connect.NewRequest(&orderv1.CheckOrderOwnerRequest{
+					OrderId: "order-456",
+					UserId:  "user-123",
+				})
 			},
-			wantErr:  true,
-			wantCode: connect.CodeInternal,
+			when: func(td *testData) {
+				td.response, td.err = td.handler.Handle(td.ctx, td.request)
+			},
+			then: func(td *testData) {
+				require.Error(td.t, td.err)
+				assert.Equal(td.t, connect.CodeInternal, connect.CodeOf(td.err))
+				assert.Nil(td.t, td.response)
+			},
 		},
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			mockStore := tt.setupMock()
-			handler := newCheckOrderOwnerHandler(mockStore)
-
-			req := connect.NewRequest(tt.request)
-			resp, err := handler.Handle(context.Background(), req)
-
-			if tt.wantErr {
-				require.Error(t, err)
-				var connectErr *connect.Error
-				require.ErrorAs(t, err, &connectErr)
-				require.Equal(t, tt.wantCode, connectErr.Code())
-			} else {
-				require.NoError(t, err)
-				if tt.validateResp != nil {
-					tt.validateResp(t, resp)
-				}
-			}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			td := setupTestData(t)
+			td.t = t
+			tc.given(td)
+			tc.when(td)
+			tc.then(td)
 		})
 	}
 }

@@ -33,25 +33,26 @@ You write **unit tests only**. Unit tests:
 - Kafka event production/consumption
 - Concurrent access with real locks
 
-## Test Structure Pattern
+## Test Structure Pattern (ОБЯЗАТЕЛЬНЫЙ)
 
-Always use the GWT (Given-When-Then) pattern with local struct definitions:
+⚠️ **GWT паттерн ОБЯЗАТЕЛЕН. Другие паттерны ЗАПРЕЩЕНЫ.**
+
+Каждый тест ДОЛЖЕН иметь структуру с полями `given`, `when`, `then`:
 
 ```go
-func TestHandler_MethodName(t *testing.T) {
-    // Define testData struct locally inside the test function
+func TestCreateOrderHandler(t *testing.T) {
+    // Define testData struct locally - Order Service specific
     type testData struct {
-        ctx          context.Context
-        t            *testing.T
-        handler      *Handler              // Component under test
-        mockStore    *storegen.StoreMock   // Mocks from internal/store/gen/
-        mockClient   *mockgen.ClientMock   // Mocks from test/mock/gen/
-        request      *pb.Request           // Input
-        response     *pb.Response          // Output
-        err          error                 // Error result
+        ctx       context.Context
+        t         *testing.T
+        server    *Server                                    // Component under test
+        mockStore *store.OrderStoreMock                      // Mock from internal/store/
+        request   *connect.Request[ordersv1.CreateOrderRequest]   // Connect request wrapper
+        response  *connect.Response[ordersv1.CreateOrderResponse] // Connect response wrapper
+        err       error                                      // Error result
     }
 
-    // Define testCase struct locally
+    // Define testCase struct locally - GWT pattern is MANDATORY
     type testCase struct {
         name  string
         given func(*testData)
@@ -61,88 +62,88 @@ func TestHandler_MethodName(t *testing.T) {
 
     // Setup function creates isolated test data for each test case
     setupTestData := func(t *testing.T) *testData {
-        // Create mocks
-        mockStore := new(storegen.StoreMock)
-        mockClient := new(mockgen.ClientMock)
+        mockStore := &store.OrderStoreMock{}
 
-        // Setup default mock behaviors
-        mockStore.GetByIDFunc = func(ctx context.Context, id uuid.UUID) (*entity.Entity, error) {
-            return &entity.Entity{ID: id}, nil
+        // Setup default mock behavior (successful save)
+        mockStore.SaveFunc = func(ctx context.Context, order *store.Order) error {
+            return nil
         }
 
-        // Create component under test
-        handler := NewHandler(mockStore, mockClient)
+        server := NewServer(mockStore)
 
         return &testData{
-            ctx:       t.Context(),
+            ctx:       context.Background(),
             t:         t,
-            handler:   handler,
+            server:    server,
             mockStore: mockStore,
-            mockClient: mockClient,
+            // request is set in given() for each test case
         }
     }
 
     testCases := []testCase{
-        // Group 1: Skip scenarios
+        // Success scenario
         {
-            name: "Should skip when condition is met",
+            name: "Should create order successfully with valid input",
             given: func(td *testData) {
-                // Setup skip condition
+                td.request = connect.NewRequest(&ordersv1.CreateOrderRequest{
+                    UserId: "user-123",
+                    Item:   "Test Item",
+                    Amount: 100,
+                })
             },
             when: func(td *testData) {
-                td.response, td.err = td.handler.Method(td.ctx, td.request)
+                td.response, td.err = td.server.CreateOrder(td.ctx, td.request)
             },
             then: func(td *testData) {
                 require.NoError(td.t, td.err)
-                assert.Len(td.t, td.mockStore.GetByIDCalls(), 0, "Store should not be called")
+                require.NotNil(td.t, td.response)
+                // Always verify specific response field values, not just NotNil
+                assert.NotEmpty(td.t, td.response.Msg.Id)
+                assert.Equal(td.t, "user-123", td.response.Msg.UserId)
+                assert.Equal(td.t, "Test Item", td.response.Msg.Item)
+                assert.Len(td.t, td.mockStore.SaveCalls(), 1)
             },
         },
 
-        // Group 2: Success scenarios
+        // Validation errors
         {
-            name: "Should process successfully with valid input",
+            name: "Should return InvalidArgument when user_id is empty",
             given: func(td *testData) {
-                td.request = &pb.Request{/* valid data */}
+                td.request = connect.NewRequest(&ordersv1.CreateOrderRequest{
+                    UserId: "",
+                    Item:   "Test Item",
+                    Amount: 100,
+                })
             },
             when: func(td *testData) {
-                td.response, td.err = td.handler.Method(td.ctx, td.request)
-            },
-            then: func(td *testData) {
-                require.NoError(td.t, td.err)
-                assert.NotNil(td.t, td.response)
-                assert.Len(td.t, td.mockStore.GetByIDCalls(), 1)
-            },
-        },
-
-        // Group 3: Validation errors
-        {
-            name: "Should return error when request is nil",
-            given: func(td *testData) {
-                td.request = nil
-            },
-            when: func(td *testData) {
-                td.response, td.err = td.handler.Method(td.ctx, td.request)
+                td.response, td.err = td.server.CreateOrder(td.ctx, td.request)
             },
             then: func(td *testData) {
                 require.Error(td.t, td.err)
-                assert.Nil(td.t, td.response)
+                assert.Equal(td.t, connect.CodeInvalidArgument, connect.CodeOf(td.err))
+                assert.Len(td.t, td.mockStore.SaveCalls(), 0, "Store should not be called")
             },
         },
 
-        // Group 4: Dependency errors
+        // Store error
         {
-            name: "Should return error when store fails",
+            name: "Should return Internal error when store fails",
             given: func(td *testData) {
-                td.mockStore.GetByIDFunc = func(_ context.Context, _ uuid.UUID) (*entity.Entity, error) {
-                    return nil, errors.New("database error")
+                td.mockStore.SaveFunc = func(_ context.Context, _ *store.Order) error {
+                    return errors.New("database error")
                 }
+                td.request = connect.NewRequest(&ordersv1.CreateOrderRequest{
+                    UserId: "user-123",
+                    Item:   "Test Item",
+                    Amount: 100,
+                })
             },
             when: func(td *testData) {
-                td.response, td.err = td.handler.Method(td.ctx, td.request)
+                td.response, td.err = td.server.CreateOrder(td.ctx, td.request)
             },
             then: func(td *testData) {
                 require.Error(td.t, td.err)
-                assert.Contains(td.t, td.err.Error(), "database error")
+                assert.Equal(td.t, connect.CodeInternal, connect.CodeOf(td.err))
             },
         },
     }
@@ -156,6 +157,42 @@ func TestHandler_MethodName(t *testing.T) {
             tc.then(td)
         })
     }
+}
+```
+
+## ❌ Anti-Patterns (ЗАПРЕЩЕНО)
+
+**НИКОГДА не используй эти паттерны:**
+
+```go
+// ❌ НЕПРАВИЛЬНО - setupMock вместо given
+tests := []struct {
+    name      string
+    setupMock func() *store.MockOrderStore  // ❌ НЕТ!
+    wantErr   bool                          // ❌ НЕТ!
+    wantCode  connect.Code                  // ❌ НЕТ!
+    validateResp func(...)                  // ❌ НЕТ!
+}{}
+
+// ❌ НЕПРАВИЛЬНО - when захардкожен в цикле
+for _, tt := range tests {
+    t.Run(tt.name, func(t *testing.T) {
+        mockStore := tt.setupMock()           // ❌ НЕТ!
+        resp, err := handler.Handle(ctx, req) // ❌ when в цикле - НЕТ!
+        if tt.wantErr { ... }                 // ❌ НЕТ!
+    })
+}
+```
+
+**ВСЕГДА используй GWT с функциями given/when/then:**
+
+```go
+// ✅ ПРАВИЛЬНО
+type testCase struct {
+    name  string
+    given func(*testData)  // ✅ ДА!
+    when  func(*testData)  // ✅ ДА!
+    then  func(*testData)  // ✅ ДА!
 }
 ```
 
